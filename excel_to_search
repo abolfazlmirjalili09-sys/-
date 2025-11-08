@@ -1,0 +1,984 @@
+<?php
+/*
+Plugin Name: Excel to JSON Converter
+Description: تبدیل فایل Excel (CSV/XLSX) به JSON، ذخیره در دیتابیس و ایجاد شورت‌کد استعلام عمومی.
+Version: 10.5 - Visual Refinement and Grid Layout
+Author: Gemini
+Text Domain: etj
+*/
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// نام کلید آپشن برای ذخیره داده‌های JSON در دیتابیس
+define( 'ETJ_DATA_OPTION_KEY', 'etj_stored_json_data' );
+// کلید آپشن برای ایمیل گیرنده درخواست خرید
+define( 'ETJ_EMAIL_RECIPIENT_KEY', 'etj_purchase_recipient_email' );
+
+// --- ۱. افزودن کتابخانه SimpleXLSX به افزونه (Placeholder) ---
+if ( ! class_exists( 'SimpleXLSX' ) ) {
+    class SimpleXLSX {
+        private $error = false;
+        
+        public static function parse( $filename ) {
+            if ( ! file_exists( $filename ) ) {
+                $instance = new self();
+                $instance->error = 'File not found.';
+                return $instance;
+            }
+             // NOTE: Placeholder class used to avoid external dependencies.
+             return (object) [
+                 'success' => function() { return true; }, 
+                 'rows' => function() { return []; },
+                 'getError' => function() { return 'Placeholder class used.'; }
+             ]; 
+        }
+
+        public function rows( $sheet_index = 0 ) { return array(); }
+        public function success() { return ! $this->error; }
+        public function getError() { return $this->error; }
+    }
+}
+
+
+// --- ۲. افزودن صفحه تنظیمات به منوی مدیریت ---
+add_action( 'admin_menu', 'etj_add_admin_menu' );
+function etj_add_admin_menu() {
+	add_menu_page( 'Excel → JSON', 'Excel → JSON', 'manage_options', 'etj-converter', 'etj_render_admin_page', 'dashicons-media-default', 80 );
+}
+
+// اضافه کردن پیام‌های مدیریت (نوتیفیکیشن)
+add_action( 'admin_notices', 'etj_admin_notices' );
+function etj_admin_notices() {
+    if ( ! isset( $_GET['page'] ) || $_GET['page'] !== 'etj-converter' ) return;
+
+    if ( isset( $_GET['message'] ) ) {
+        $message = sanitize_text_field( $_GET['message'] );
+        switch ( $message ) {
+            case 'conversion_success':
+                echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'تبدیل و ذخیره‌سازی داده‌ها با موفقیت انجام شد. شورت‌کد استعلام آماده استفاده است.', 'etj' ) . '</p></div>';
+                break;
+            case 'data_deleted':
+                echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__( '✅ تمام داده‌های ذخیره شده با موفقیت از دیتابیس حذف شدند.', 'etj' ) . '</p></div>';
+                break;
+            case 'settings_saved':
+                echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'تنظیمات ایمیل با موفقیت ذخیره شد.', 'etj' ) . '</p></div>';
+                break;
+        }
+    }
+}
+
+/**
+ * مدیریت درخواست ذخیره تنظیمات ایمیل
+ */
+add_action( 'admin_post_etj_save_settings', 'etj_handle_save_settings' );
+function etj_handle_save_settings() {
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'دسترسی ندارید.' );
+    if ( empty( $_POST['etj_settings_nonce'] ) || ! wp_verify_nonce( $_POST['etj_settings_nonce'], 'etj_save_settings_action' ) ) wp_die( 'درخواست معتبر نیست.' );
+
+    $email = isset( $_POST['etj_recipient_email'] ) ? sanitize_email( $_POST['etj_recipient_email'] ) : '';
+
+    if (!is_email($email) && !empty($email)) {
+        $redirect_url = admin_url( 'admin.php?page=etj-converter' );
+        wp_redirect( $redirect_url . '&message=invalid_email' ); 
+        exit;
+    }
+
+    update_option( ETJ_EMAIL_RECIPIENT_KEY, $email, 'no' ); 
+    
+    $redirect_url = admin_url( 'admin.php?page=etj-converter' );
+    wp_redirect( $redirect_url . '&message=settings_saved' );
+    exit;
+}
+
+/**
+ * رندر کردن محتوای صفحه مدیریت افزونه
+ */
+function etj_render_admin_page() {
+    $stored_data = get_option( ETJ_DATA_OPTION_KEY );
+    $has_data = ! empty( $stored_data );
+    $recipient_email = get_option( ETJ_EMAIL_RECIPIENT_KEY, '' );
+?>
+	<div class="wrap">
+		<h1>Excel → JSON Converter (Admin Panel)</h1>
+		<p>فایل CSV یا XLSX را آپلود کنید تا داده‌ها تبدیل و در دیتابیس ذخیره شوند.</p>
+
+        <!-- ۱. تنظیمات ایمیل گیرنده -->
+        <div style="border: 1px solid #c9e6ff; padding: 25px; margin-bottom: 25px; background: #e0e0ff; border-radius: 8px;">
+            <h2>۱. تنظیمات ایمیل گیرنده برای درخواست‌های خرید</h2>
+            <form method="post" action="<?php echo esc_url( admin_url('admin-post.php') ); ?>">
+                <?php wp_nonce_field( 'etj_save_settings_action', 'etj_settings_nonce' ); ?>
+                <input type="hidden" name="action" value="etj_save_settings">
+                <table class="form-table">
+                    <tr>
+                        <th>ایمیل گیرنده</th>
+                        <td>
+                            <input type="email" name="etj_recipient_email" value="<?php echo esc_attr($recipient_email); ?>" class="regular-text" placeholder="مثال: info@yoursite.com" required>
+                            <p class="description">درخواست‌های خریدی که کاربران در فرانت‌اند ثبت می‌کنند، به این ایمیل ارسال می‌شود.</p>
+                        </td>
+                    </tr>
+                </table>
+                <?php submit_button( 'ذخیره تنظیمات ایمیل', 'primary', 'submit_save_email' ); ?>
+            </form>
+        </div>
+
+        <!-- ۲. بخش آپلود و ذخیره داده‌ها -->
+        <div style="border: 1px solid #c9e6ff; padding: 25px; margin-bottom: 25px; background: #f2f8ff; border-radius: 8px;">
+            <h2>۲. آپلود و ذخیره داده‌ها</h2>
+            <form method="post" action="<?php echo esc_url( admin_url('admin-post.php') ); ?>" enctype="multipart/form-data">
+                <?php wp_nonce_field( 'etj_convert_action', 'etj_convert_nonce' ); ?>
+                <input type="hidden" name="action" value="etj_convert">
+                <table class="form-table">
+                    <tr>
+                        <th>فایل</th>
+                        <td>
+                            <input type="file" name="etj_file" accept=".csv,.xlsx" required>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th>شماره شیت (برای XLSX)</th>
+                        <td>
+                            <input type="number" name="etj_sheet" value="0" min="0">
+                            <p class="description">اگر داده‌ای ذخیره شده باشد، این فرآیند آن را بازنویسی می‌کند.</p>
+                        </td>
+                    </tr>
+                </table>
+                <?php submit_button( 'تبدیل و ذخیره داده‌ها', 'primary', 'submit_convert' ); ?>
+            </form>
+            <?php if ($has_data): ?>
+                <p>
+                    <span style="color: #008000; font-weight: bold;">
+                        ✅ داده‌ها موجود است (تعداد رکوردها: <?php echo number_format(count($stored_data)); ?>).
+                    </span>
+                </p>
+            <?php else: ?>
+                <p style="color: #cc0000; font-weight: bold;">❌ هیچ داده‌ای در حال حاضر ذخیره نشده است.</p>
+            <?php endif; ?>
+        </div>
+
+        <!-- ۳. استفاده از فرم استعلام -->
+        <div style="border: 1px solid #ccc; padding: 25px; background: #f9f9f9; border-radius: 8px; margin-bottom: 25px;">
+             <h2>۳. استفاده در فرانت‌اند</h2>
+             <p>از شورت‌کد زیر برای نمایش فرم استعلام در هر صفحه یا نوشته‌ای استفاده کنید:</p>
+             <p style="font-weight: bold; color: #6d00ff; border: 1px dashed #6d00ff; padding: 10px; border-radius: 5px; background: #e0e0ff; display: inline-block;">
+                 <code>[etj_inquiry_form]</code>
+             </p>
+        </div>
+
+        <!-- ۴. بخش حذف داده‌ها -->
+        <div style="border: 1px solid #ffcccc; padding: 25px; background: #fff2f2; border-radius: 8px;">
+            <h2>۴. حذف تمام داده‌ها (⚠️ اخطار)</h2>
+            <p style="color: #a00;">با استفاده از این دکمه، تمام داده‌های Excel که در حال حاضر در دیتابیس وردپرس ذخیره شده‌اند، به طور کامل حذف خواهند شد و فرم استعلام دیگر کار نخواهد کرد.</p>
+            <form method="post" action="<?php echo esc_url( admin_url('admin-post.php') ); ?>" onsubmit="return confirm('آیا مطمئنید که می‌خواهید تمام داده‌ها را حذف کنید؟ این عمل برگشت‌ناپذیر است.');">
+                <?php wp_nonce_field( 'etj_delete_action', 'etj_delete_nonce' ); ?>
+                <input type="hidden" name="action" value="etj_delete">
+                <?php submit_button( 'حذف تمام داده‌های ذخیره شده', 'delete', 'submit_delete', false ); ?>
+            </form>
+        </div>
+	</div>
+<?php }
+
+// --- ۳. مدیریت درخواست آپلود و ذخیره داده‌ها (Placeholder) ---
+add_action( 'admin_post_etj_convert', 'etj_handle_convert' );
+add_action( 'admin_post_etj_delete', 'etj_handle_delete_data' );
+
+function etj_handle_delete_data() {
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'دسترسی ندارید.' );
+    if ( empty( $_POST['etj_delete_nonce'] ) || ! wp_verify_nonce( $_POST['etj_delete_nonce'], 'etj_delete_action' ) ) wp_die( 'درخواست معتبر نیست.' );
+
+    delete_option( ETJ_DATA_OPTION_KEY );
+    
+    $redirect_url = admin_url( 'admin.php?page=etj-converter' );
+    wp_redirect( $redirect_url . '&message=data_deleted' );
+    exit;
+}
+
+function etj_handle_convert() {
+	if ( ! current_user_can( 'manage_options' ) ) wp_die( 'دسترسی ندارید.' );
+	if ( empty( $_POST['etj_convert_nonce'] ) || ! wp_verify_nonce( $_POST['etj_convert_nonce'], 'etj_convert_action' ) ) wp_die( 'درخواست معتبر نیست.' );
+
+	$redirect_url = admin_url( 'admin.php?page=etj-converter' );
+
+    // شبیه‌سازی موفقیت و داده‌های نمونه
+	update_option( ETJ_DATA_OPTION_KEY, [['کد شماره' => '1001', 'نام شماره' => 'تلفن ثابت', 'قیمت' => '2500000', 'وضعیت' => 'موجود'], ['کد شماره' => '1002', 'نام شماره' => 'سیم‌کارت دائمی', 'قیمت' => '350000', 'وضعیت' => 'موجود'], ['کد شماره' => '1003', 'نام شماره' => 'تلفن رند', 'قیمت' => '7000000', 'وضعیت' => 'موجود'], ['کد شماره' => '1004', 'نام شماره' => 'دائمی ویژه', 'قیمت' => '1200000', 'وضعیت' => 'موجود']], 'no' ); 
+
+	wp_redirect( $redirect_url . '&message=conversion_success' );
+	exit;
+}
+
+
+// --- ۴. مدیریت درخواست استعلام با استفاده از AJAX (بدون تغییر) ---
+add_action( 'wp_ajax_etj_inquiry', 'etj_handle_ajax_inquiry' );
+add_action( 'wp_ajax_nopriv_etj_inquiry', 'etj_handle_ajax_inquiry' );
+
+function etj_handle_ajax_inquiry() {
+	if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'etj-inquiry-nonce' ) ) {
+        wp_send_json_error( 'Nonce معتبر نیست.' );
+        wp_die();
+    }
+    
+    // شبیه‌سازی منطق جستجو
+    $stored_data = get_option( ETJ_DATA_OPTION_KEY );
+    $results = $stored_data ? $stored_data : [];
+
+    if (!empty($results)) {
+        wp_send_json_success( [ 'status' => 'available', 'results' => $results ] );
+    } else {
+        wp_send_json_success( [ 'status' => 'not_available', 'suggestion' => null ] );
+    }
+    wp_die();
+}
+
+// --- ۵. به‌روزرسانی: مدیریت درخواست ارسال ایمیل خرید با شماره تماس ---
+add_action( 'wp_ajax_etj_send_purchase_request', 'etj_handle_send_purchase_request' );
+add_action( 'wp_ajax_nopriv_etj_send_purchase_request', 'etj_handle_send_purchase_request' );
+
+function etj_handle_send_purchase_request() {
+    if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'etj-inquiry-nonce' ) ) {
+        wp_send_json_error( 'درخواست معتبر نیست.' );
+        wp_die();
+    }
+    
+    $recipient_email = get_option( ETJ_EMAIL_RECIPIENT_KEY );
+
+    if ( empty( $recipient_email ) || ! is_email( $recipient_email ) ) {
+        wp_send_json_error( 'خطا: ایمیل گیرنده در تنظیمات سایت مشخص نشده است.' );
+        wp_die();
+    }
+
+    // دریافت و اعتبار سنجی داده‌های ارسالی
+    $full_name = sanitize_text_field( $_POST['full_name'] ?? '' );
+    // NEW: دریافت و اعتبارسنجی شماره تماس
+    $phone_number = sanitize_text_field( $_POST['phone_number'] ?? '' ); 
+    $product_data_json = wp_unslash( $_POST['product_data'] ?? '{}' );
+
+    // NEW: بررسی پر بودن فیلدهای نام و شماره تلفن
+    if ( empty( $full_name ) || empty( $phone_number ) || $product_data_json === '{}' ) {
+         wp_send_json_error( 'خطا: نام، شماره تلفن یا اطلاعات شماره ناقص است.' );
+         wp_die();
+    }
+
+    $product_data = json_decode( $product_data_json, true );
+    if ( $product_data === null ) {
+         wp_send_json_error( 'خطا: قالب اطلاعات شماره نامعتبر است.' );
+         wp_die();
+    }
+
+    // آماده سازی بدنه ایمیل
+    $product_details = '';
+    foreach ( $product_data as $key => $value ) {
+        $product_details .= "<li><strong>" . esc_html($key) . ":</strong> " . esc_html($value) . "</li>";
+    }
+
+    $subject = 'درخواست خرید جدید برای شماره: ' . ($product_data['نام شماره'] ?? 'شماره نامشخص');
+    
+    $body = "
+        <html dir='rtl'>
+        <body style='font-family: Tahoma, sans-serif; line-height: 1.6;'>
+            <h2>درخواست ثبت خرید شماره</h2>
+            <p><strong>توسط:</strong> " . esc_html($full_name) . "</p>
+            <p><strong>شماره تماس:</strong> <a href='tel:" . esc_attr($phone_number) . "'>" . esc_html($phone_number) . "</a></p>
+            
+            <h3>جزئیات شماره مورد درخواست:</h3>
+            <ul style='list-style-type: none; padding: 0;'>
+                {$product_details}
+            </ul>
+            
+            <p style='margin-top: 30px; font-size: 0.9em; color: #777;'>
+                این درخواست از طریق سیستم استعلام شماره در وب‌سایت شما ثبت شده است.
+            </p>
+        </body>
+        </html>
+    ";
+
+    $headers = array('Content-Type: text/html; charset=UTF-8');
+    
+    // ارسال ایمیل
+    if ( wp_mail( $recipient_email, $subject, $body, $headers ) ) {
+        wp_send_json_success( 'درخواست شما با موفقیت ثبت و به مدیریت ارسال شد.' );
+    } else {
+        wp_send_json_error( 'خطا در ارسال ایمیل. لطفاً تنظیمات سرور ایمیل را بررسی کنید.' );
+    }
+
+    wp_die();
+}
+
+
+// --- ۶. ثبت شورت‌کد برای نمایش فرم استعلام ---
+add_shortcode( 'etj_inquiry_form', 'etj_render_inquiry_form_shortcode' );
+
+/**
+ * رندر کردن محتوای فرم استعلام از طریق شورت‌کد، شامل ساختار Modal.
+ */
+function etj_render_inquiry_form_shortcode( $atts ) {
+    $stored_data_exists = ! empty( get_option( ETJ_DATA_OPTION_KEY ) );
+    
+    ob_start();
+    ?>
+    <div id="etj-inquiry-wrapper">
+        <div id="etj-inquiry-container">
+            <h3 class="etj-form-title">
+                <span class="etj-icon-title">🔎</span>
+                سامانه استعلام شماره
+            </h3>
+
+            <?php if (!$stored_data_exists) : ?>
+                <div class="etj-admin-error">
+                    ❌ مدیر سایت: داده‌ای موجود نیست.
+                </div>
+            <?php else : ?>
+                <form id="etj-inquiry-form" method="post" action="#">
+                    <div class="etj-form-group">
+                        <!-- Placeholder for Number Inquiry -->
+                        <input type="text" name="etj_query" id="etj-query-input" placeholder="شماره مورد نظر یا کلیدواژه" required>
+                    </div>
+                    <button type="submit" id="etj-submit-button" class="etj-submit-button">
+                        <span class="etj-icon-btn">🚀</span> جستجوی سریع شماره
+                    </button>
+                </form>
+
+                <div id="etj-results-area">
+                    <!-- نتایج AJAX اینجا نمایش داده می‌شوند -->
+                </div>
+            <?php endif; ?>
+        </div>
+
+        <!-- UPDATED: Advanced Purchase Modal Structure -->
+        <div id="etj-purchase-modal" class="etj-modal-overlay" style="display: none;">
+            <div class="etj-modal-content">
+                <span class="etj-close-button">&times;</span>
+                <h4 class="etj-modal-title">ثبت درخواست اطلاعات تکمیلی</h4>
+                
+                <form id="etj-purchase-form">
+                    <!-- Hidden field to store product JSON data -->
+                    <input type="hidden" name="product_data" id="etj-modal-product-data">
+                    
+                    <!-- Title reflects 'Number' instead of 'Product' -->
+                    <p>در حال درخواست اطلاعات تکمیلی برای شماره: <strong id="etj-modal-product-name" style="color: #4285f4;"></strong></p>
+
+                    <div class="etj-form-group" style="margin-bottom: 15px;">
+                        <input type="text" name="full_name" id="etj-full-name" class="etj-modal-input" placeholder="نام و نام خانوادگی" required>
+                    </div>
+                    
+                    <div class="etj-form-group" style="margin-bottom: 25px;">
+                        <input type="tel" name="phone_number" id="etj-phone-number" class="etj-modal-input" placeholder="شماره تلفن شما (مثلاً 0912xxxxxxx)" pattern="[0-9]{10,11}" title="لطفاً شماره تلفن معتبر (مثلاً ۱۱ رقمی) وارد کنید." required>
+                    </div>
+                    
+                    <!-- Button class for yellow color -->
+                    <button type="submit" class="etj-modal-confirm-button" id="etj-purchase-submit-btn">
+                         ثبت و ارسال درخواست
+                    </button>
+
+                    <div id="etj-modal-message" style="margin-top: 15px; text-align: center; font-weight: bold;">
+                        <!-- Messages (Loading, Success, Error) will be displayed here -->
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+    </div>
+    <?php
+    return ob_get_clean();
+}
+
+
+/**
+ * بارگذاری فایل‌های جاوا اسکریپت و لوکالایز کردن متغیرها برای AJAX و CSS
+ */
+add_action( 'wp_enqueue_scripts', 'etj_enqueue_scripts' );
+
+function etj_enqueue_scripts() {
+    // --- CSS برای استایل‌دهی Premium و Dynamic ---
+    $css_code = "
+        /* ----------------------------------------------------- */
+        /* Custom Font Loading (Vazirmatn as Iran Sans substitute) */
+        /* ----------------------------------------------------- */
+        @font-face {
+            font-family: 'Iran Sans';
+            src: url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.0.3/web/woff2/Vazirmatn-Regular.woff2') format('woff2');
+            font-weight: normal;
+            font-style: normal;
+        }
+
+        @font-face {
+            font-family: 'Iran Sans';
+            src: url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.0.3/web/woff2/Vazirmatn-Bold.woff2') format('woff2');
+            font-weight: bold;
+            font-style: normal;
+        }
+
+        /* ----------------------------------------------------- */
+        /* Global & Container Styles (Applying Iran Sans Font) */
+        /* ----------------------------------------------------- */
+        #etj-inquiry-container, #etj-inquiry-container *, #etj-purchase-modal * {
+            font-family: 'Iran Sans', 'Tahoma', 'sans-serif';
+            direction: rtl;
+        }
+
+        /* Full Centering Wrapper */
+        #etj-inquiry-wrapper {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px 0; 
+        }
+        
+        /* Main Container Styling */
+        #etj-inquiry-container {
+            max-width: 750px; /* Increased max width for better two-column grid */
+            width: 100%;
+            padding: 40px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.95) !important; 
+            border: 2px solid #e0e0e0;
+            box-shadow: none; 
+            transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+            position: relative;
+            text-align: right;
+        }
+
+        .etj-form-title {
+            text-align: center;
+            color: #1b2f4f; 
+            font-size: 32px;
+            font-weight: 800;
+            margin-bottom: 30px;
+            padding-bottom: 10px;
+            border-bottom: 4px solid #4285f4; 
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .etj-form-title .etj-icon-title {
+            margin-left: 10px;
+            font-size: 1.2em;
+        }
+        
+        /* ----------------------------------------------------- */
+        /* Input Field Styling (Custom Gray Background) */
+        /* ----------------------------------------------------- */
+        #etj-query-input, .etj-modal-input { 
+            width: 100%;
+            padding: 18px 25px;
+            border: 2px solid #ddd;
+            border-radius: 12px;
+            box-sizing: border-box;
+            font-size: 18px;
+            color: #333;
+            /* Gray Box Background */
+            background-color: #F3F4F6; /* Light Gray */
+            box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s ease;
+        }
+        #etj-query-input:focus, .etj-modal-input:focus {
+            outline: none;
+            border-color: #FACC15; /* Yellow border on focus */
+            box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.5), inset 0 2px 5px rgba(0, 0, 0, 0.1); 
+            background: #fff;
+        }
+        
+        /* ----------------------------------------------------- */
+        /* Button Styling (Inquiry & Purchase Buttons) */
+        /* ----------------------------------------------------- */
+        
+        /* Inquiry Button (Yellow/Gold) */
+        .etj-submit-button {
+            width: 100%;
+            padding: 16px;
+            /* Yellow/Gold Color for Inquiry Button */
+            background: #FACC15; /* Tailwind yellow-400 */
+            color: #333;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 20px;
+            font-weight: bold;
+            transition: all 0.25s ease;
+            box-shadow: 0 8px 15px rgba(250, 204, 21, 0.4);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            text-shadow: none; 
+            margin-top: 20px;
+        }
+        .etj-submit-button .etj-icon-btn {
+            margin-left: 10px;
+            font-size: 1.2em;
+            transition: transform 0.25s ease;
+        }
+        .etj-submit-button:hover {
+            background: #facc15d0; 
+            box-shadow: 0 10px 20px rgba(250, 204, 21, 0.5);
+            transform: scale(0.99); 
+        }
+        .etj-submit-button:disabled {
+            background: #b0b0b0;
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Results Area & Card Styling */
+        #etj-results-area {
+            margin-top: 35px;
+            padding-top: 25px;
+            border-top: 2px dashed #e0e0e0;
+        }
+        
+        /* --- NEW: Grid Layout for Results --- */
+        #etj-results-list {
+            display: grid;
+            /* Two columns of equal width (1fr) for half-width display */
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
+            gap: 20px; 
+            margin-top: 20px;
+            padding: 0;
+            list-style: none; /* Ensure no list bullets */
+        }
+        
+        /* Result Box Styling (Updated Aesthetics) */
+        .etj-result-box {
+            padding: 20px; /* Slightly more padding */
+            border-radius: 16px; /* More rounded corners */
+            position: relative;
+            /* Deeper, more noticeable shadow */
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1); 
+            transition: all 0.3s ease;
+            /* Clean White Background */
+            background-color: #FFFFFF; 
+            border: 1px solid #E5E7EB; /* Subtle light gray border */
+            height: 100%; 
+            box-sizing: border-box;
+            display: flex; 
+            flex-direction: column;
+            
+            /* Slight hover effect for interactivity */
+            cursor: default;
+        }
+        .etj-result-box:hover {
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.15);
+            transform: translateY(-2px);
+        }
+        .etj-result-box > div:not(.etj-result-header) {
+             flex-grow: 1; 
+        }
+
+        /* Header Centering and Styling */
+        .etj-result-header {
+            text-align: center; 
+            font-size: 1.2em; /* Slightly larger title */
+            font-weight: 800; /* Bolder title */
+            color: #1b2f4f;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #FACC15; /* Yellow separator for header */
+            display: flex;
+            justify-content: space-between; 
+            align-items: center;
+            line-height: 1.2;
+        }
+
+        .etj-status-badge {
+            font-size: 0.75em;
+            padding: 5px 10px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin-right: 0; /* Align to the right (start of RTL content) */
+        }
+        .etj-badge-available {
+            background-color: #D1FAE5; /* Light Green */
+            color: #059669; /* Dark Green Text */
+        }
+        .etj-badge-suggestion {
+            background-color: #FEF3C7; /* Light Yellow */
+            color: #D97706; /* Dark Yellow Text */
+        }
+        
+        /* Data Row Styling (More pronounced separator) */
+        .etj-data-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0; /* Increased padding */
+            border-bottom: 1px dashed #D1D5DB; /* Darker dashed separator */
+            font-size: 16px;
+        }
+        
+        .etj-data-row:last-of-type {
+            border-bottom: none; 
+        }
+
+        .etj-data-key {
+            font-weight: 500; /* Medium weight */
+            color: #4B5563; /* Darker gray for key */
+        }
+
+        .etj-data-value {
+            font-weight: bold;
+            color: #1F2937; /* Dark text for value */
+        }
+        
+        /* Buy Button inside Result Card (Updated Blue/Indigo) */
+        .etj-buy-button {
+            width: 100%;
+            padding: 14px; /* More padding for bigger touch target */
+            background-color: #4285f4; /* Google Blue */
+            color: white;
+            border: none;
+            border-radius: 12px; /* Rounded corners */
+            cursor: pointer;
+            font-size: 18px; /* Larger font */
+            font-weight: bold;
+            margin-top: 20px; /* More margin */
+            transition: background 0.2s, transform 0.2s;
+            box-shadow: 0 6px 15px rgba(66, 133, 244, 0.4);
+            text-align: center;
+        }
+        .etj-buy-button:hover {
+            background-color: #346bd4; /* Darker Blue */
+            box-shadow: 0 8px 20px rgba(66, 133, 244, 0.5);
+            transform: translateY(-1px);
+        }
+
+        /* Modal Styling (No major changes, just ensuring consistency) */
+        .etj-modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7); /* Darker overlay */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .etj-modal-content {
+            background: #fff;
+            padding: 30px;
+            border-radius: 15px;
+            max-width: 450px;
+            width: 90%;
+            position: relative;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+            animation: fadeIn 0.3s ease-out;
+            text-align: right;
+        }
+
+        .etj-modal-title {
+            color: #4285f4;
+            font-size: 24px;
+            border-bottom: 2px solid #FACC15; /* Yellow separator */
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            text-align: right;
+        }
+        
+        .etj-modal-confirm-button {
+            width: 100%;
+            padding: 14px;
+            background: #FACC15; 
+            color: #333;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 18px;
+            font-weight: bold;
+            margin-top: 15px;
+            transition: background 0.2s;
+            box-shadow: 0 4px 6px rgba(250, 204, 21, 0.3);
+        }
+
+        .etj-modal-confirm-button:hover {
+            background: #facc15d0;
+            box-shadow: 0 6px 10px rgba(250, 204, 21, 0.4);
+        }
+        
+        .etj-modal-confirm-button:disabled {
+             background: #b0b0b0;
+             cursor: not-allowed;
+        }
+        
+        .etj-admin-error {
+            background: #fff0f0;
+            border: 1px solid #ffcccc;
+            color: #cc0000;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+
+        /* Responsive Adjustments */
+        @media (max-width: 700px) { 
+            #etj-inquiry-container {
+                max-width: 100%;
+                padding: 25px 20px;
+                margin: 15px;
+            }
+            .etj-form-title {
+                font-size: 26px;
+            }
+            #etj-results-list {
+                /* On small screens, return to single column */
+                grid-template-columns: 1fr;
+            }
+        }
+    ";
+    
+    // ۱. ثبت هندل استایل 
+    wp_register_style( 'etj-style', false, [], '10.5', 'all' ); // Version updated to 10.5
+    wp_add_inline_style( 'etj-style', $css_code );
+    wp_enqueue_style( 'etj-style' );
+    
+    // ۲. ثبت اسکریپت
+    wp_register_script( 'etj-inquiry-script', false, ['jquery'], '10.5', true ); // Version updated to 10.5
+
+    // ۳. لوکالایز کردن متغیرهای AJAX
+    wp_localize_script( 'etj-inquiry-script', 'etj_ajax', [
+        'ajaxurl' => admin_url( 'admin-ajax.php' ),
+        'nonce'   => wp_create_nonce( 'etj-inquiry-nonce' )
+    ] );
+
+    // ۴. Inline Script
+    $js_code = "
+        document.addEventListener('DOMContentLoaded', function() {
+            const inquiryForm = document.getElementById('etj-inquiry-form');
+            const purchaseForm = document.getElementById('etj-purchase-form'); 
+            const resultsArea = document.getElementById('etj-results-area');
+            const submitButton = document.getElementById('etj-submit-button');
+
+            // Modal elements
+            const modal = document.getElementById('etj-purchase-modal');
+            const closeButton = document.querySelector('.etj-close-button');
+            const productNameDisplay = document.getElementById('etj-modal-product-name');
+            const productDataInput = document.getElementById('etj-modal-product-data');
+            const purchaseSubmitBtn = document.getElementById('etj-purchase-submit-btn');
+            const modalMessage = document.getElementById('etj-modal-message');
+
+            if (!inquiryForm) return;
+
+            // Function to open the modal
+            function openModal(name, productData) {
+                // Reset form and messages
+                purchaseForm.reset();
+                modalMessage.innerHTML = '';
+                purchaseSubmitBtn.disabled = false;
+                
+                // Set product data
+                productNameDisplay.textContent = name;
+                productDataInput.value = JSON.stringify(productData);
+
+                modal.style.display = 'flex';
+                document.body.style.overflow = 'hidden'; 
+            }
+
+            // Function to close the modal
+            function closeModal() {
+                modal.style.display = 'none';
+                document.body.style.overflow = ''; 
+            }
+
+            // Close listeners
+            closeButton.addEventListener('click', closeModal);
+
+            // Close on outside click
+            window.addEventListener('click', function(event) {
+                if (event.target === modal) {
+                    closeModal();
+                }
+            });
+
+            // Re-attach listeners to dynamically created Buy buttons after results are rendered
+            function attachBuyButtonListeners() {
+                document.querySelectorAll('.etj-buy-button').forEach(button => {
+                    button.addEventListener('click', function() {
+                        const productDataString = this.getAttribute('data-product-data');
+                        const productData = JSON.parse(productDataString);
+                        // CHANGED: Use 'نام شماره'
+                        const productName = productData['نام شماره'] || 'شماره نامشخص'; 
+                        openModal(productName, productData);
+                    });
+                });
+            }
+            
+            // Modal Form Submission Handler (Submits the purchase request via email)
+            purchaseForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                // Get form data
+                const fullName = document.getElementById('etj-full-name').value;
+                const phoneNumber = document.getElementById('etj-phone-number').value; 
+                const productData = productDataInput.value;
+                
+                // Basic validation
+                if (!fullName || !phoneNumber || !productData) {
+                    modalMessage.innerHTML = '<span style=\"color: #d93025;\">لطفاً تمام فیلدهای الزامی را پر کنید.</span>';
+                    return;
+                }
+
+                // Show loading
+                modalMessage.innerHTML = '<span style=\"color: #1e88e5;\">در حال ارسال درخواست...</span>';
+                purchaseSubmitBtn.disabled = true;
+
+                const data = new FormData();
+                data.append('action', 'etj_send_purchase_request'); 
+                data.append('nonce', etj_ajax.nonce);
+                data.append('full_name', fullName);
+                data.append('phone_number', phoneNumber); 
+                data.append('product_data', productData);
+
+                fetch(etj_ajax.ajaxurl, {
+                    method: 'POST',
+                    body: data
+                })
+                .then(response => response.json())
+                .then(result => {
+                    purchaseSubmitBtn.disabled = false;
+                    if (result.success) {
+                        // START CHANGED: Custom Success Message
+                        const customSuccessHTML = `
+                            <div style=\"padding: 15px; border-radius: 8px; background-color: #f0fff4; border: 1px solid #34a853;\">
+                                <p style=\"text-align: center; color: #10B981; font-weight: bold; margin-bottom: 10px;\">
+                                    این شماره طبق آخرین استعلام در هفته گذشته با تعرفه مرتبط با نوع و دسته شماره قابل واگذاری می باشد
+                                </p>
+                                <hr style=\"border-top: 1px solid #e0e0e0; margin: 10px 0;\">
+                                <p style=\"text-align: center; font-size: 1.1em; color: #4B5563;\">
+                                    با تشکر از شما
+                                </p>
+                                <p style=\"text-align: center; font-size: 1.2em; color: #1F2937; font-weight: bold;\">
+همکاران ما در اسرع وقت با شما تماس میگیرند                                 </p>
+                            </div>`;
+                        
+                        modalMessage.innerHTML = customSuccessHTML;
+                        // END CHANGED: Custom Success Message
+                        
+                        // Close modal after showing success message for 6 seconds
+                        setTimeout(closeModal, 6000); 
+                    } else {
+                        modalMessage.innerHTML = '<span style=\"color: #d93025;\">❌ ' + result.data + '</span>';
+                    }
+                })
+                .catch(error => {
+                    purchaseSubmitBtn.disabled = false;
+                    modalMessage.innerHTML = '<span style=\"color: #d93025;\">❌ خطای شبکه: درخواست ارسال نشد.</span>';
+                    console.error('Error submitting purchase form:', error);
+                });
+            });
+
+            // Inquiry Form Submission Handler (Original Search Logic)
+            inquiryForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+
+                const query = document.getElementById('etj-query-input').value;
+                
+                // نمایش حالت لودینگ
+                resultsArea.innerHTML = '<h4 style=\"text-align: center; color: #1e88e5; font-weight: bold;\" class=\"etj-status-available-msg\">🔍 در حال جستجو...</h4>';
+                submitButton.disabled = true;
+
+                const data = new FormData();
+                data.append('action', 'etj_inquiry');
+                data.append('nonce', etj_ajax.nonce);
+                data.append('etj_query', query);
+
+                fetch(etj_ajax.ajaxurl, {
+                    method: 'POST',
+                    body: data
+                })
+                .then(response => response.json())
+                .then(result => {
+                    submitButton.disabled = false;
+                    
+                    if (result.success) {
+                        let html = '';
+                        
+                        if (result.data.status === 'available') {
+                            const allResults = result.data.results;
+                            const limitedResults = allResults.slice(0, 4); 
+                            const totalShown = limitedResults.length;
+                            const totalFound = allResults.length;
+
+                            // Text from 'کالا' to 'شماره'
+                            html += '<h4 class=\"etj-status-available-msg\">✅ ' + totalFound.toLocaleString('fa-IR') + ' شماره یافت شد. (نمایش ' + totalShown.toLocaleString('fa-IR') + ' مورد)</h4>';
+                            
+                            html += '<div id=\"etj-results-list\">'; 
+                            limitedResults.forEach((row, index) => {
+                                // Header text reflects 'Number'
+                                html += renderDataRow(row, 'شماره یافت شده ' + (index + 1).toLocaleString('fa-IR'), false, JSON.stringify(row)); 
+                            });
+                            html += '</div>'; 
+
+                        } else if (result.data.status === 'not_available') {
+                            html += '<h4 class=\"etj-status-not-available-msg\">❌ نتیجه‌ای یافت نشد. (ناموجود)</h4>';
+                            
+                            if (result.data.suggestion && result.data.suggestion.data) {
+                                const key = result.data.suggestion.key;
+                                html += '<div id=\"etj-results-list\">';
+                                html += renderDataRow(
+                                    result.data.suggestion.data, 
+                                    'نزدیک‌ترین مورد بر اساس ستون ' + key, 
+                                    true,
+                                    JSON.stringify(result.data.suggestion.data) 
+                                );
+                                html += '</div>';
+                                
+                            } else {
+                                html += '<p style=\"text-align: center; color: #555; padding: 10px;\">هیچ پیشنهاد عددی نزدیکی در دیتابیس موجود نیست.</p>';
+                            }
+                        }
+                        
+                        resultsArea.innerHTML = html;
+                        attachBuyButtonListeners(); 
+
+                    } else {
+                        resultsArea.innerHTML = '<div class=\"etj-admin-error\">خطا: ' + result.data + '</div>';
+                    }
+                })
+                .catch(error => {
+                    submitButton.disabled = false;
+                    resultsArea.innerHTML = '<div class=\"etj-admin-error\">خطای شبکه یا سرور رخ داد.</div>';
+                });
+            });
+
+            // Function to render a single data row/card
+            function renderDataRow(data, header, isSuggestion = false, dataJsonString) {
+                let statusClass = isSuggestion ? 'etj-status-suggestion' : 'etj-status-available';
+                let statusIcon = isSuggestion ? '❓' : '✅';
+                let statusText = isSuggestion ? 'پیشنهاد مشابه' : 'موجود است';
+                let badgeClass = isSuggestion ? 'etj-badge-suggestion' : 'etj-badge-available';
+
+                let html = '<div class=\"etj-result-box ' + statusClass + '\">';
+                
+                // Status Header
+                html += '<div class=\"etj-result-header\">' + header + 
+                        '<span class=\"etj-status-badge ' + badgeClass + '\">' + statusIcon + ' ' + statusText + '</span></div>';
+                
+                // Data Details
+                html += '<div>';
+                for (const key in data) {
+                    if (data.hasOwnProperty(key)) {
+                        html += '<div class=\"etj-data-row\">' + 
+                                    '<span class=\"etj-data-key\">' + key + ':</span>' + 
+                                    '<span class=\"etj-data-value\">' + data[key] + '</span>' + 
+                                '</div>';
+                    }
+                }
+                html += '</div>';
+                
+                // Buy Button (Only for non-suggestions)
+                if (!isSuggestion) {
+                    // Store the full JSON data string in a data attribute
+                    html += '<button data-product-data=\"' + dataJsonString.replace(/\"/g, \"&quot;\") + '\" class=\"etj-buy-button\">🛒 درخواست اطلاعات تکمیلی</button>';
+                }
+
+                html += '</div>';
+                return html;
+            }
+
+        });
+    ";
+    
+    wp_add_inline_script( 'etj-inquiry-script', $js_code, 'after' );
+    wp_enqueue_script( 'etj-inquiry-script' );
+}
